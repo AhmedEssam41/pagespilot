@@ -1,0 +1,106 @@
+import * as Sentry from "@sentry/node";
+import { nodeProfilingIntegration } from "@sentry/profiling-node";
+
+// Initialize Sentry before anything else
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  integrations: [
+    nodeProfilingIntegration(),
+    Sentry.prismaIntegration(),
+  ],
+  // Performance Monitoring
+  tracesSampleRate: 1.0, 
+  // Set sampling rate for profiling
+  profilesSampleRate: 1.0,
+});
+
+import { env } from "@config/env";
+import { createServer } from "http";
+import app from "./app";
+import { initSocket } from "@modules/realtime/socket";
+
+import { 
+  startMetaQueue, 
+  expressWorker, 
+  productionWorker 
+} from "@modules/meta/core/meta.queue";
+import { startMediaRefreshJob } from "@modules/media/mediaRefresh.job";
+import { socialWorker } from "@modules/content/social.worker"; 
+import { logger } from "@utils/logger";
+import prisma from "@config/prisma";
+
+const { PORT } = env;
+
+const httpServer = createServer(app);
+initSocket(httpServer);
+
+const server = httpServer.listen(PORT, "0.0.0.0", async () => {
+  logger.info(`Server running on port ${PORT}`);
+  
+  // Start the background queue loop for delayed/scheduled jobs
+  startMetaQueue();
+  // Daily WhatsApp media ID refresh (expires after 30 days)
+  startMediaRefreshJob();
+});
+
+// Graceful shutdown engine
+const gracefulShutdown = async (signal: string) => {
+  logger.info(`${signal} received. Starting professional graceful shutdown...`);
+
+  // 1. Force exit fallback (Safety Net)
+  const forceExitTimeout = setTimeout(() => {
+    logger.error("SHUTDOWN TIMEOUT: Forcefully terminating process.");
+    process.exit(1);
+  }, 15000);
+
+  try {
+    // 2. Stop accepting new HTTP/Socket requests
+    server.close(() => {
+      logger.info("HTTP & Socket.io server closed.");
+    });
+
+    // 3. Gracefully close BullMQ Workers to prevent job corruption
+    const workers = [expressWorker, productionWorker, socialWorker];
+    for (const worker of workers) {
+      if (worker && typeof worker.close === "function") {
+        await worker.close();
+        logger.info(`Worker ${worker.name || "unnamed"} closed.`);
+      }
+    }
+
+    // 4. Final Disconnect: Database
+    await prisma.$disconnect();
+    logger.info("Database connection closed cleanly.");
+
+    clearTimeout(forceExitTimeout);
+    logger.info("--- Graceful Shutdown Complete ---");
+    process.exit(0);
+  } catch (err: any) {
+    logger.error("CRITICAL SHUTDOWN FAILURE:", { error: err.message });
+    process.exit(1);
+  }
+};
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Handle unhandled rejections and uncaught exceptions
+process.on("unhandledRejection", (err: any) => {
+  logger.error("UNHANDLED REJECTION! 💥", {
+    error: err.message,
+    stack: err.stack,
+  });
+  gracefulShutdown("UNHANDLED_REJECTION");
+});
+
+process.on("uncaughtException", (err: any) => {
+  logger.error("UNCAUGHT EXCEPTION! 💥", {
+    error: err.message,
+    stack: err.stack,
+  });
+  gracefulShutdown("UNCAUGHT_EXCEPTION");
+});
+
+
+
+
